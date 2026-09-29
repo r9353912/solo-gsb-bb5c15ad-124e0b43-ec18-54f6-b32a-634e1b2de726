@@ -10,8 +10,30 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+
+def iso_ts_key(text: object) -> str | None:
+    """把 ISO 8601 UTC 文本归一化为定宽、可安全字典序比较的排序键。
+
+    必须用本函数（或 Python 侧 parse_iso 后的真实 datetime 比较）判定时间先后，
+    不能直接比较原始文本：Python isoformat() 在微秒为 0 时省略小数秒，库中既有的
+    整秒记录形如 ``2026-09-29T12:00:00Z``，与带小数秒的
+    ``2026-09-29T12:00:00.000001Z`` 直接做文本比较时，'Z'(0x5A) > '.'(0x2E)，
+    整秒时刻反而被判为更晚——已到期的变更/预占因此停留在 pending。
+    本函数把两种写法统一为 ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` 定宽形式，
+    归一化结果的字典序与真实 UTC 先后完全一致，兼容库中已有记录。
+    """
+    if text is None:
+        return None
+    dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    # 显式补齐 6 位微秒并统一以 Z 结尾，保证所有键等宽，字典序 == 真实 UTC 先后
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 # 所有策略层（全局 / 租户 / 路由）的公共行
 # scope: 'global' | 'tenant' | 'route'
@@ -183,7 +205,8 @@ CREATE TABLE IF NOT EXISTS reservations (
     buckets_json   TEXT NOT NULL
 ) STRICT;
 
--- 到期清扫只扫描 pending 行（部分索引），expire_at 与 ISO 8601 UTC 文本可直接字典序比较
+-- 到期清扫只扫描 pending 行（部分索引），时间先后判定必须经 iso_ts_key()
+-- 归一化（整秒 ...Z 与带微秒 ... .ffffffZ 混存时原始文本字典序不可靠）
 CREATE INDEX IF NOT EXISTS idx_reservations_due
 ON reservations (expire_at)
 WHERE status = 'pending';
@@ -244,6 +267,10 @@ def connect(path: str | None = None) -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+    # 时间先后一律走 iso_ts_key 归一化（整秒 ...Z 与小数秒 ... .ffffffZ 混存，
+    # 原始文本字典序与真实 UTC 先后不一致）。deterministic 函数可安全用于
+    # WHERE / ORDER BY，且所有连接（含测试直连）行为一致。
+    conn.create_function("iso_ts_key", 1, iso_ts_key, deterministic=True)
     # WAL + busy_timeout 让并发写者自动排队等待而不是立刻报锁
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")

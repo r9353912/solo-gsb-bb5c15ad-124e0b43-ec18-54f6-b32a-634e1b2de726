@@ -581,6 +581,11 @@ print(urllib.request.urlopen(req).read().decode())
 > ```
 >
 > 裁决、撤销与所有 GET 仍然直接用普通 `curl`，无需任何头。
+>
+> 一个可直接运行、自带 HMAC 签名与断言的 Python（仅标准库）端到端示例见
+> [`examples/policy_change_time_boundary.py`](examples/policy_change_time_boundary.py)：
+> 它登记**整秒**生效的定时切换，在生效点所在同一秒内（带微秒）发起裁决，
+> 验证变更在余额计算前生效、只应用一次、版本审计一致，以及预占整秒到期边界。
 
 ### 1. 配置三级策略 🔐
 
@@ -791,7 +796,10 @@ admin_curl DELETE /policy-changes/chg-1
 ```
 
 到期时刻**不需要任何后台动作**：60 秒后的第一次 `POST /decide` 会在同一事务内
-先应用变更再裁决。以上面余额 5 / 旧容量 10、新容量 20 为例：
+先应用变更再裁决。生效判定按真实 UTC 时刻：`effective_at` 既可以带小数秒，也
+可以是整秒（如 `...T12:00:00Z`）；即使裁决发生在生效点所在的那一秒内、但带微秒
+（如 `...T12:00:00.054993Z`），只要 `now >= effective_at`（**恰好到期也生效**）
+就先应用，库中已有的整秒记录无需迁移。以上面余额 5 / 旧容量 10、新容量 20 为例：
 
 1. 先按旧速率 `0.5/s` 把余额补充到 `effective_at`：`min(10, 5 + 0.5×60) = 10`；
 2. 按剩余比例换算到新容量：`10 / 10 × 20 = 20`；
@@ -1372,6 +1380,33 @@ admin_curl POST /route-transfers '{
   - 接口为第五个 HMAC 管理写接口：四个签名头、300 秒时间窗、nonce 防重放与
     「业务失败回滚不占 nonce」的约定与其余管理写接口完全一致；`BEGIN IMMEDIATE`
     串行化保证并发移拨不会把源桶扣成负数。
+- **时间与到期边界（UTC，整秒与小数秒混存，本轮修复）**：
+  - 所有时间均为显式带时区的 UTC（存储形如 `2026-09-27T12:00:10.123456Z`）。
+    服务端按**真实 UTC 时刻先后**判定到期，绝不直接比较原始文本——微秒为 0 时
+    文本省略小数秒（整秒形如 `2026-09-27T12:00:10Z`），而 `'Z'` 的码位大于
+    `'.'`，文本字典序会把同一整秒时刻误判为「晚于」带微秒的同秒时刻，导致
+    已到期变更/预占滞留 `pending`、裁决与路由令牌移拨沿用旧策略。
+  - 内部统一用定宽归一化键（SQL 函数 `iso_ts_key()` 把列值归一成
+    `YYYY-MM-DDTHH:MM:SS.ffffffZ`）或 Python `parse_iso()` 后的真实 `datetime`
+    比较，因此**库中既有的整秒记录无需迁移**即可正确参与判定；新写入时间格式
+    （有微秒时带 6 位小数、否则整秒）与 HTTP 接口均保持不变。
+  - 边界语义为：`effective_at <= now` 即到期——**恰好到期也立即生效**，
+    `now < effective_at`（哪怕只差 1 微秒）一律不提前应用；预占 `expire_at`
+    同此规则（恰好到期即转 `expired` 并返还，确认/取消/结算返回 409）；
+    `GET /quota-usage` 的窗口 `[start, end)` 左闭右开也按真实 UTC 判定。
+  - 已到期变更在各余额写入口（`POST /decide`、`POST /decide-batches`、
+    `POST /decide/{id}/revoke`、`POST /reservations` 及其确认/取消/结算、
+    `POST /route-transfers` 的前序事务、`PUT /policies`、
+    `POST /policies/rollback`）的**本次余额计算之前**于同一事务应用，应用时
+    沿用「旧策略补充至生效点 → 按剩余比例 `旧余额/旧容量×新容量` 换算 →
+    新策略自生效点续补」规则；同一条变更只应用一次（条件 UPDATE
+    `status='pending'` 抢占），并只在实际生效的事务内追加一条
+    `source=scheduled` 的不可变版本，版本审计链保持一致。
+  - 生效时刻仍在未来的 pending 变更约束不变：`PUT /policies`、
+    `POST /policies/rollback` 返回 409，`impact-preview` 返回 409，
+    `DELETE /policy-changes/{id}` 可正常取消；已到期（含恰好到期）后取消返回 409。
+  - 只读的 `POST /quota-plans` 仍按现行策略演算、**不推进**定时变更与预占到期
+    状态（与到期判定正确性无关，保持其既有快照语义）。
 
 ## 本地开发（不用 Docker）
 

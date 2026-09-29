@@ -3982,3 +3982,320 @@ def test_route_transfer_then_replay_returns_post_transfer_balances(client):
     assert replay["source"]["balance"] == 6.0
     assert replay["target"]["balance"] == 7.0
     assert replay["transferred_at"] == first["transferred_at"]
+
+
+# ====================================== 整秒/小数秒 UTC 时间边界（本轮回归）
+#
+# 背景：Python isoformat() 在微秒为 0 时省略小数秒，库中整秒时间形如
+# ``...:00Z``。原始文本与带小数秒（``...:00.000001Z``）直接字典序比较时
+# 'Z'(0x5A) > '.'(0x2E)，整秒时刻反被判为更晚，已到期变更/预占滞留 pending。
+# 下列测试固定 fake clock 从整秒起步，把生效/到期时刻登记为整秒，再把时钟
+# 拨到同一秒内带微秒的位置，验证各入口按真实 UTC 先后判定。
+
+
+@pytest.fixture()
+def frac_clock(client, monkeypatch) -> _FakeClock:
+    """整秒起步的可控时钟；advance 支持小数秒，模拟同秒内带微秒的当前时刻。"""
+    from app import quota
+
+    clk = _FakeClock(datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(quota, "now_utc", clk.now)
+    return clk
+
+
+def _whole_second_change(client, change_id, scope, capacity, rate, *,
+                         at_second, tenant=None, route=None):
+    """登记一条 effective_at 恰为整秒的定时切换（库存文本无小数秒 ...Z）。"""
+    return admin_call(
+        client, "POST", "/policy-changes",
+        {
+            "change_id": change_id,
+            "scope": scope,
+            "tenant_id": tenant,
+            "route_id": route,
+            "capacity": capacity,
+            "refill_rate": rate,
+            "effective_at": _iso(
+                datetime(2026, 9, 27, 12, 0, at_second, tzinfo=timezone.utc)
+            ),
+        },
+    )
+
+
+def test_whole_second_change_applied_same_second_with_microseconds(client, frac_clock):
+    # 核心回归：effective_at=12:00:10（整秒文本 ...:10Z），裁决发生在
+    # 12:00:10.500000（同一秒内带微秒），变更必须已在本次余额计算前应用。
+    put_policy(client, "global", 100, 0)
+    assert _whole_second_change(client, "chg-ws", "global", 50, 0,
+                                at_second=10).status_code == 200
+    # 库存确为无小数秒的整秒文本（老记录形态）
+    assert client.get("/policy-changes/chg-ws").json()["effective_at"] == \
+        "2026-09-27T12:00:10Z"
+
+    frac_clock.advance(10.5)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1})
+    b = r.json()["buckets"][0]
+    assert b["capacity"] == 50.0                      # 新策略已生效
+    assert client.get("/policy-changes/chg-ws").json()["status"] == "applied"
+
+
+def test_whole_second_change_not_applied_one_microsecond_early(client, frac_clock):
+    # 未到期不得提前应用：距整秒生效点差 1 微秒仍是旧策略
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-early", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.0 - 1e-6)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1})
+    assert r.json()["buckets"][0]["capacity"] == 100.0
+    assert client.get("/policy-changes/chg-early").json()["status"] == "pending"
+
+
+def test_whole_second_change_applied_at_exact_boundary(client, frac_clock):
+    # 恰好到期（now == effective_at，同为整秒）也应生效
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-exact", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1})
+    assert r.json()["buckets"][0]["capacity"] == 50.0
+    assert client.get("/policy-changes/chg-exact").json()["status"] == "applied"
+
+
+def test_whole_second_change_applied_once_and_one_scheduled_version(client, frac_clock):
+    # 同一变更只应用一次、版本审计一致：应用后再次裁决不再追加 scheduled 版本
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-once", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.5)
+    client.post("/decide", json={"request_id": "d1", "cost": 1})
+    frac_clock.advance(0.4)
+    client.post("/decide", json={"request_id": "d2", "cost": 1})
+    h = history(client, "global").json()
+    scheduled = [v for v in h if v["source"] == "scheduled"]
+    assert len(scheduled) == 1
+    assert scheduled[0]["change_id"] == "chg-once"
+    assert [v["version"] for v in h] == [2, 1]
+
+
+def test_whole_second_change_cancel_conflicts_same_second_microseconds(client, frac_clock):
+    # 12:00:10.5 取消 effective_at=12:00:10（整秒）的变更 -> 409，变更不被误取消
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-cancel", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.5)
+    assert admin_call(client, "DELETE", "/policy-changes/chg-cancel").status_code == 409
+    # 取消接口不惰性应用变更（与既有语义一致）：行仍 pending，随后裁决才应用
+    assert client.get("/policy-changes/chg-cancel").json()["status"] == "pending"
+    d = client.post("/decide", json={"request_id": "d-after", "cost": 1})
+    assert d.json()["buckets"][0]["capacity"] == 50.0
+    assert client.get("/policy-changes/chg-cancel").json()["status"] == "applied"
+
+
+def test_whole_second_change_future_still_cancellable(client, frac_clock):
+    # 未到期（差 1 微秒）仍可取消，保持原有错误语义
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-future", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.0 - 1e-6)
+    r = admin_call(client, "DELETE", "/policy-changes/chg-future")
+    assert r.status_code == 200
+    assert r.json()["status"] == "cancelled"
+
+
+def test_put_policy_applies_due_whole_second_change_before_balance(client, frac_clock):
+    # PUT 入口也按真实 UTC：到期变更先应用（追加 scheduled 版本），再执行更新；
+    # 旧容量 100、速率 0、花掉 80（余 20）；切到容量 50 按比例 -> 10，
+    # 随后 PUT 容量 200 时余额 10 不截断
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "d0", "cost": 80})
+    _whole_second_change(client, "chg-put", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.5)
+    r = put_policy(client, "global", 200, 0)
+    assert r.status_code == 200
+    bal = _global_balance(client)
+    assert bal == pytest.approx(10.0)
+    assert client.get("/policy-changes/chg-put").json()["status"] == "applied"
+    h = history(client, "global").json()
+    assert [v["source"] for v in h[:2]] == ["put", "scheduled"]
+
+
+def test_put_policy_still_conflicts_on_future_pending(client, frac_clock):
+    # 生效点未到（差 1 微秒）的 pending 仍按原语义 409
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-putf", "global", 50, 0, at_second=10)
+    frac_clock.advance(10.0 - 1e-6)
+    assert put_policy(client, "global", 200, 0).status_code == 409
+    assert client.get("/policy-changes/chg-putf").json()["status"] == "pending"
+
+
+def test_rollback_applies_due_whole_second_change_first(client, frac_clock):
+    # 回滚入口同样先应用到期变更（产生 scheduled v2），再回滚到 v1（rollback v3）
+    put_policy(client, "global", 100, 0)
+    _whole_second_change(client, "chg-rb", "global", 50, 0, at_second=10)
+
+    frac_clock.advance(10.5)
+    r = rollback(client, "global", 1)
+    assert r.status_code == 200
+    assert client.get("/policies").json()[0]["capacity"] == 100.0
+    assert [v["source"] for v in history(client, "global").json()] == [
+        "rollback", "scheduled", "put",
+    ]
+    assert client.get("/policy-changes/chg-rb").json()["status"] == "applied"
+
+
+def test_whole_second_reservation_expiry_with_microsecond_now(client, frac_clock):
+    # 预占在整秒创建（expire_at=12:01:00 整秒文本），12:01:00.5 确认 ->
+    # 到期优先：转 expired 并返还，确认返回 409（旧文本比较会误确认成功）
+    put_policy(client, "global", 10, 0)
+    r = _reserve(client, "rsv-ws", 4, ttl=60)
+    assert r.json()["expire_at"] == "2026-09-27T12:01:00Z"
+    assert _global_balance(client) == 6.0
+
+    frac_clock.advance(60.5)
+    c = client.post("/reservations/rsv-ws/confirm")
+    assert c.status_code == 409
+    got = client.get("/reservations/rsv-ws").json()
+    assert got["status"] == "expired"
+    assert _global_balance(client) == 10.0       # 已返还
+
+
+def test_whole_second_reservation_cancel_at_exact_expiry_goes_expired(client, frac_clock):
+    # 恰好到期（12:01:00 整秒 == expire_at）取消 -> 到期优先 expired，不取消
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-exact", 4, ttl=60)
+
+    frac_clock.advance(60)
+    r = client.post("/reservations/rsv-exact/cancel")
+    assert r.status_code == 409
+    assert client.get("/reservations/rsv-exact").json()["status"] == "expired"
+    assert _global_balance(client) == 10.0
+
+
+def test_whole_second_reservation_confirm_allowed_one_microsecond_early(client, frac_clock):
+    # 未到期（差 1 微秒）确认仍成功，不提前判到期
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-early", 4, ttl=60)
+
+    frac_clock.advance(60.0 - 1e-6)
+    r = client.post("/reservations/rsv-early/confirm")
+    assert r.status_code == 200
+    assert r.json()["status"] == "confirmed"
+    assert _global_balance(client) == 6.0       # 确认不返还
+
+
+def test_whole_second_reservation_settle_expiry_boundary(client, frac_clock):
+    # 整秒到期点：差 1 微秒可结算；恰好/已到期则前序清扫先转 expired 再 409
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-s1", 4, ttl=60)
+    _reserve(client, "rsv-s2", 4, ttl=60)
+
+    frac_clock.advance(60.0 - 1e-6)
+    r = _settle(client, "rsv-s1", 4)
+    assert r.status_code == 200 and r.json()["status"] == "settled"
+
+    frac_clock.advance(1e-6)                    # 恰好 12:01:00
+    r2 = _settle(client, "rsv-s2", 4)
+    assert r2.status_code == 409
+    assert client.get("/reservations/rsv-s2").json()["status"] == "expired"
+
+
+def test_route_transfer_applies_whole_second_due_change(client, frac_clock):
+    # 移拨前序事务：整秒生效点在同秒带微秒时已到期，必须先切换再移拨。
+    # rB 容量 10、花掉 5（余 5）；到期切到 20 -> 余额按比例 10；rA 满额 10
+    _setup_two_routes(client, cap_a=10, cap_b=10)
+    client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 5},
+    )
+    _whole_second_change(client, "chg-tr", "route", 20, 0,
+                         at_second=10, tenant="t1", route="rB")
+
+    frac_clock.advance(10.5)
+    r = _transfer(client, "tr-ws", "t1", "rA", "rB", 3)
+    assert r.status_code == 200
+    assert r.json()["source"]["balance"] == 7.0
+    assert r.json()["target"]["balance"] == 13.0   # 10（换算后）+ 3
+    assert client.get("/policy-changes/chg-tr").json()["status"] == "applied"
+
+
+def test_batch_decide_applies_whole_second_due_change(client, frac_clock):
+    # 批量裁决入口：同秒带微秒时到期切换先应用，再演算整批
+    put_policy(client, "global", 50, 0)
+    _whole_second_change(client, "chg-batch", "global", 20, 0, at_second=10)
+
+    frac_clock.advance(10.5)
+    r = client.post(
+        "/decide-batches",
+        json={
+            "batch_id": "b1",
+            "requests": [{"request_id": "bd1", "cost": 15}],
+        },
+    )
+    body = r.json()
+    assert body["committed"] is True
+    assert body["results"][0]["buckets"][0]["capacity"] == 20.0
+    assert client.get("/policy-changes/chg-batch").json()["status"] == "applied"
+
+
+def test_usage_window_mixed_whole_second_and_fractional_rows(client, frac_clock):
+    # 只读报表窗口：整秒 decided_at（...Z）与带小数秒混存，左闭右开按真实 UTC
+    put_policy(client, "global", 1000, 0)
+    client.post("/decide", json={"request_id": "at-whole", "cost": 1})  # 12:00:00Z
+    frac_clock.advance(0.5)
+    client.post("/decide", json={"request_id": "at-half", "cost": 10})  # 12:00:00.5Z
+
+    # 窗口起点在整秒之后 0.5s：恰在起点的 at-half 计入（左闭），at-whole 不计入
+    start = frac_clock.now()
+    body = _usage(client, _iso(start), _iso(frac_clock.now() + timedelta(seconds=60))).json()
+    assert body["total_consumed"] == 10.0
+
+    # 起点为整秒：两笔都计入（整秒记录被正确包含）
+    body2 = _usage(
+        client,
+        _iso(datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)),
+        _iso(datetime(2026, 9, 27, 12, 1, 0, tzinfo=timezone.utc)),
+    ).json()
+    assert body2["total_consumed"] == 11.0
+
+
+def test_legacy_whole_second_rows_in_db_are_handled(tmp_path, monkeypatch):
+    """兼容老库：直接写入整秒 effective_at / expire_at 的存量记录，
+    在带微秒的当前时刻也能按真实 UTC 判定到期。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy.db"
+    monkeypatch.setenv("QUOTA_DB_PATH", str(db_file))
+    monkeypatch.setenv("ADMIN_KEY_ID", ADMIN_KEY_ID)
+    monkeypatch.setenv("ADMIN_HMAC_SECRET", ADMIN_HMAC_SECRET)
+    import importlib
+
+    from app import database, main, quota
+
+    importlib.reload(database)
+    importlib.reload(main)
+    database.init_db(str(db_file))
+    c = database.connect(str(db_file))
+    with database.write_tx(c):
+        quota.upsert_policy(c, scope="global", tenant_id=None, route_id=None,
+                            capacity=100, refill_rate=0)
+        # 模拟历史写入：整秒生效变更（无小数秒）
+        c.execute(
+            """INSERT INTO policy_changes
+               (change_id, scope, tenant_id, route_id, new_capacity,
+                new_refill_rate, new_low_balance_threshold, effective_at,
+                status, created_at, applied_at, cancelled_at)
+               VALUES ('chg-legacy','global','','',50,0,NULL,
+                       '2026-09-27T12:00:10Z','pending',
+                       '2026-09-27T11:59:00Z',NULL,NULL)"""
+        )
+    c.close()
+
+    clk = _FakeClock(datetime(2026, 9, 27, 12, 0, 10, 300000, tzinfo=timezone.utc))
+    monkeypatch.setattr(quota, "now_utc", clk.now)
+
+    with TestClient(main.app) as client:
+        r = client.post("/decide", json={"request_id": "legacy-1", "cost": 1})
+        assert r.status_code == 200
+        assert r.json()["buckets"][0]["capacity"] == 50.0
+        assert client.get("/policy-changes/chg-legacy").json()["status"] == "applied"
