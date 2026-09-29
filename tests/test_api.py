@@ -936,6 +936,141 @@ def test_cancel_after_effective_time_conflicts(client):
     assert admin_call(client, "DELETE", "/policy-changes/ch2").status_code == 409
 
 
+# ---- 整秒生效时刻与小数秒当前时刻的边界（本轮时间比较修复）----
+
+
+def _insert_pending_change(client, change_id, *, effective: datetime,
+                           capacity=50.0, refill_rate=0.0, scope="global",
+                           tenant=None, route=None):
+    """绕过「必须是未来时间」校验，直接写入一条 pending 定时变更，
+    用于精确控制 effective_at 的文本形态（含历史整秒格式）。"""
+    import sqlite3
+    from app.database import db_path
+    conn = sqlite3.connect(db_path())
+    try:
+        conn.execute(
+            "INSERT INTO policy_changes (change_id,scope,tenant_id,route_id,"
+            "new_capacity,new_refill_rate,new_low_balance_threshold,"
+            "effective_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,'pending',?)",
+            (
+                change_id, scope, tenant or "", route or "",
+                capacity, refill_rate, None,
+                effective, effective,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_whole_second_effective_at_applied_within_same_fractional_second(client, clock):
+    # 旧库形态：effective_at 为整秒文本 ...00Z；当前时刻在同一秒内、带微秒。
+    # 修复前字符串比较把整秒误判为更晚 -> 变更保持 pending；修复后必须生效。
+    put_policy(client, "global", 100, 0)
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    _insert_pending_change(client, "ch-whole", effective=eff.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"), capacity=50, refill_rate=0)
+
+    clock.t = eff.replace(microsecond=500000)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1}).json()
+    # 满额 100 按比例换算为 50，再扣 1
+    assert r["allowed"] is True
+    assert r["buckets"][0]["capacity"] == 50.0
+    assert r["buckets"][0]["balance"] == 49.0
+    ch = client.get("/policy-changes/ch-whole").json()
+    assert ch["status"] == "applied"
+    # 同一变更只应用一次：版本审计恰有一条 scheduled（另加初始 put 共两条）
+    hist = history(client, "global").json()
+    assert [v["source"] for v in hist] == ["scheduled", "put"]
+    assert hist[0]["change_id"] == "ch-whole"
+
+    # 再次裁决不重复应用、不重复追加版本
+    client.post("/decide", json={"request_id": "d2", "cost": 1})
+    assert [v["source"] for v in history(client, "global").json()] == [
+        "scheduled", "put"]
+
+
+def test_exact_effective_instant_applies(client, clock):
+    # 恰好到期（now == effective_at）也应在本次余额计算前生效
+    put_policy(client, "global", 100, 0)
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    _insert_pending_change(client, "ch-exact",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+                           capacity=50, refill_rate=0)
+    clock.t = eff
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1}).json()
+    assert r["buckets"][0]["capacity"] == 50.0
+    assert r["buckets"][0]["balance"] == 49.0
+    assert client.get("/policy-changes/ch-exact").json()["status"] == "applied"
+
+
+def test_before_effective_instant_not_applied(client, clock):
+    # 未到期不得提前应用：同秒内早于生效点 1 微秒
+    put_policy(client, "global", 100, 0)
+    eff = datetime(2026, 9, 27, 12, 0, 0, 500000, tzinfo=timezone.utc)
+    _insert_pending_change(client, "ch-future",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+                           capacity=50, refill_rate=0)
+    clock.t = eff.replace(microsecond=499999)
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1}).json()
+    assert r["buckets"][0]["capacity"] == 100.0
+    assert client.get("/policy-changes/ch-future").json()["status"] == "pending"
+    # 生效点过后（微秒级）立即应用
+    clock.t = eff
+    client.post("/decide", json={"request_id": "d2", "cost": 1})
+    assert client.get("/policy-changes/ch-future").json()["status"] == "applied"
+
+
+def test_whole_second_effective_at_cancel_within_same_second_conflicts(client, clock):
+    put_policy(client, "global", 100, 0)
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+    # 场景一：整秒生效时刻已到（当前在同秒带微秒）：取消必须 409
+    _insert_pending_change(client, "ch-cancel-late",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           capacity=50, refill_rate=0)
+    clock.t = eff.replace(microsecond=1)
+    assert admin_call(
+        client, "DELETE", "/policy-changes/ch-cancel-late").status_code == 409
+    assert client.get(
+        "/policy-changes/ch-cancel-late").json()["status"] == "pending"
+
+    # 场景二：生效点前一微秒仍可取消（不提前判到期）；用独立租户策略，
+    # 避开场景一仍 pending 的唯一索引
+    put_policy(client, "tenant", 100, 0, tenant="tc")
+    _insert_pending_change(client, "ch-cancel-early", scope="tenant",
+                           tenant="tc",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           capacity=50, refill_rate=0)
+    clock.t = eff - timedelta(microseconds=1)
+    r = admin_call(client, "DELETE", "/policy-changes/ch-cancel-early")
+    assert r.status_code == 200
+    assert r.json()["status"] == "cancelled"
+
+
+def test_legacy_whole_second_change_balance_ratio_and_new_rate(client, clock):
+    # 旧策略续补到生效点 -> 剩余比例换算 -> 新策略续补，且历史锚点被规范化。
+    # 旧容量 100、速率 10；在 11:59:59.000000 打空 50（余 50，锚点 .00），
+    # 变更在 12:00:00.000000 切到容量 20、速率 100（effective_at 为整秒旧文本）。
+    put_policy(client, "global", 100, 10)
+    base = datetime(2026, 9, 27, 11, 59, 59, tzinfo=timezone.utc)
+    clock.t = base
+    client.post("/decide", json={"request_id": "d0", "cost": 50})
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    _insert_pending_change(client, "ch-mix",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           capacity=20, refill_rate=100)
+    # 生效点旧策略先补 1s*10=10 -> 60；比例 60/100*20=12；锚点移到生效点
+    clock.t = eff
+    r = client.post("/decide", json={"request_id": "d1", "cost": 1}).json()
+    assert r["buckets"][0]["capacity"] == 20.0
+    assert r["buckets"][0]["balance"] == 11.0
+    # 生效后 0.5s：按新速率补 50，封顶 20 -> 扣 1 后 19
+    clock.t = eff.replace(microsecond=500000)
+    r2 = client.post("/decide", json={"request_id": "d2", "cost": 1}).json()
+    assert r2["buckets"][0]["balance"] == 19.0
+
+
 # ------------------------------------------------------------ 策略版本审计与回滚
 
 
@@ -1145,7 +1280,7 @@ def test_old_database_is_backfilled_with_baseline_versions(tmp_path):
             assert h[0]["version"] == 1
             assert h[0]["source"] == "baseline"
             assert h[0]["capacity"] == 10.0
-            assert h[0]["created_at"] == "2026-01-01T00:00:00Z"
+            assert h[0]["created_at"] == "2026-01-01T00:00:00.000000Z"
             # baseline 可直接作为回滚目标
             rolled = quota.rollback_policy(
                 conn, scope="global", tenant_id=None, route_id=None, version=1
@@ -2148,7 +2283,7 @@ def test_reservation_deducts_all_hit_buckets_and_saves_origin(client, clock):
     assert body["allowed"] is True
     assert body["replayed"] is False
     assert body["ttl_seconds"] == 60
-    assert body["expire_at"] == "2026-09-27T12:01:00Z"
+    assert body["expire_at"] == "2026-09-27T12:01:00.000000Z"
     assert [b["scope"] for b in body["buckets"]] == ["global", "tenant", "route"]
     assert [b["balance"] for b in body["buckets"]] == [7.0, 3.0, 1.0]
 
@@ -2235,7 +2370,7 @@ def test_confirm_only_transitions_without_deduction(client, clock):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "confirmed"
-    assert body["confirmed_at"] == "2026-09-27T12:00:00Z"
+    assert body["confirmed_at"] == "2026-09-27T12:00:00.000000Z"
     assert _global_balance(client) == 7.0  # 确认不再扣减
 
     # 重复确认幂等，不改变余额
@@ -2263,7 +2398,7 @@ def test_cancel_refunds_original_buckets_capped_at_capacity(client, clock):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "cancelled"
-    assert body["cancelled_at"] == "2026-09-27T12:00:01Z"
+    assert body["cancelled_at"] == "2026-09-27T12:00:01.000000Z"
     buckets = {b["scope"]: b["balance"] for b in body["buckets"]}
     assert buckets["global"] == 10.0   # 10 + 3 超过容量，截断不超过当前容量
     assert buckets["tenant"] == 6.0    # 3 + 3 = 6（租户速率 0 无补充，恰好回到容量）
@@ -2294,7 +2429,7 @@ def test_expiry_wins_over_confirm_at_boundary(client, clock):
     assert r.status_code == 409
     body = client.get("/reservations/rsv-e").json()
     assert body["status"] == "expired"
-    assert body["expired_at"] == "2026-09-27T12:01:00Z"
+    assert body["expired_at"] == "2026-09-27T12:01:00.000000Z"
     assert _global_balance(client) == 10.0  # 到期已返还
 
     # 到期后确认/取消均 409；重复查询终态不变、余额不变
@@ -2323,7 +2458,7 @@ def test_get_reservation_returns_status_and_expiry_and_cleans_due(client, clock)
 
     before = client.get("/reservations/rsv-g").json()
     assert before["status"] == "pending"
-    assert before["expire_at"] == "2026-09-27T12:01:00Z"
+    assert before["expire_at"] == "2026-09-27T12:01:00.000000Z"
     assert before["expired_at"] is None
     assert _global_balance(client) == 7.0  # 未到期查询不动余额
 
@@ -2332,7 +2467,7 @@ def test_get_reservation_returns_status_and_expiry_and_cleans_due(client, clock)
     after = client.get("/reservations/rsv-g").json()
     assert after["status"] == "expired"
     # expired_at 是惰性转换实际发生的事务时刻（与 policy_changes.applied_at 同语义）
-    assert after["expired_at"] == "2026-09-27T12:01:01Z"
+    assert after["expired_at"] == "2026-09-27T12:01:01.000000Z"
     assert _global_balance(client) == 10.0
 
     assert client.get("/reservations/missing").status_code == 404
@@ -2370,6 +2505,128 @@ def test_due_pending_blocks_new_reservation_until_swept(client, clock):
     body = _reserve(client, "rsv-new2", 1, ttl=10).json()
     assert body["status"] == "pending"
     assert _global_balance(client) == 4.0
+
+
+def _insert_pending_reservation(client, reservation_id, *, expire_text, cost=3):
+    """直接写入一条 pending 预占（含指定文本形态的 expire_at），
+    并把对应 cost 从全局桶预先扣除，模拟历史整秒记录。"""
+    import sqlite3
+    from app.database import db_path
+    conn = sqlite3.connect(db_path())
+    try:
+        # 全局桶惰性创建：不存在则按容量满额落库（updated_at 用生效前的时刻）
+        if conn.execute("SELECT 1 FROM buckets WHERE scope='global'").fetchone() is None:
+            cap = conn.execute(
+                "SELECT capacity FROM policies WHERE scope='global'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO buckets (scope,tenant_id,route_id,balance,updated_at) "
+                "VALUES ('global','','',?,?)",
+                (float(cap), "2026-09-27T11:59:00.000000Z"))
+        conn.execute(
+            "UPDATE buckets SET balance = balance - ? WHERE scope='global'", (cost,))
+        conn.execute(
+            "INSERT INTO reservations (reservation_id,payload_hash,payload_json,"
+            "status,tenant_id,route_id,cost,ttl_seconds,created_at,expire_at,"
+            "confirmed_at,cancelled_at,expired_at,actual_cost,settled_at,buckets_json) "
+            "VALUES (?,?,?,'pending','','',?,60,?,?,NULL,NULL,NULL,NULL,NULL,?)",
+            (
+                reservation_id, "h",
+                json.dumps({"tenant_id": None, "route_id": None,
+                            "cost": float(cost), "ttl_seconds": 60}),
+                cost, expire_text, expire_text,
+                json.dumps([["global", "", ""]]),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_legacy_whole_second_expiry_swept_within_fractional_second(client, clock):
+    # 旧库记录：expire_at 为整秒文本；当前时刻在同一秒内带微秒 -> 必须按到期处理
+    put_policy(client, "global", 10, 0)
+    exp = datetime(2026, 9, 27, 12, 1, 0, tzinfo=timezone.utc)
+    _insert_pending_reservation(
+        client, "rsv-legacy", expire_text=exp.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    assert _global_balance(client) == 7.0
+    clock.t = exp.replace(microsecond=900000)
+
+    # GET 触发该预占自身的惰性到期清理并返还
+    body = client.get("/reservations/rsv-legacy").json()
+    assert body["status"] == "expired"
+    assert _global_balance(client) == 10.0
+
+    # 到期后确认 / 取消 / 结算均 409
+    assert client.post("/reservations/rsv-legacy/confirm").status_code == 409
+    assert client.post("/reservations/rsv-legacy/cancel").status_code == 409
+    assert _settle(client, "rsv-legacy", 3).status_code == 409
+    # 重复到期不重复返还
+    assert _global_balance(client) == 10.0
+
+
+def test_fractional_expiry_exact_and_near_boundary(client, clock):
+    # 小数秒 expire_at：恰好到期生效，差一微秒不到期
+    put_policy(client, "global", 10, 0)
+    exp = datetime(2026, 9, 27, 12, 0, 0, 500000, tzinfo=timezone.utc)
+    _insert_pending_reservation(
+        client, "rsv-fr",
+        expire_text=exp.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z")
+    assert _global_balance(client) == 7.0
+
+    clock.t = exp - timedelta(microseconds=1)
+    assert client.get("/reservations/rsv-fr").json()["status"] == "pending"
+    assert client.post("/reservations/rsv-fr/confirm").status_code == 200
+    # confirmed 在到期后仍保持 confirmed
+    clock.t = exp
+    assert client.get("/reservations/rsv-fr").json()["status"] == "confirmed"
+
+
+def test_legacy_whole_second_expiry_swept_by_decide_before_balance(client, clock):
+    # 裁决事务在余额计算前清扫整秒到期的预占（返还先于本次扣减）
+    put_policy(client, "global", 10, 0)
+    exp = datetime(2026, 9, 27, 12, 1, 0, tzinfo=timezone.utc)
+    _insert_pending_reservation(
+        client, "rsv-sweep", expire_text=exp.strftime("%Y-%m-%dT%H:%M:%SZ"), cost=8)
+    assert _global_balance(client) == 2.0
+    clock.t = exp.replace(microsecond=100)
+    # 不到期时这笔 cost=8 的裁决会被拒（余 2）；到期返还 8 后余 10 -> 允许
+    r = client.post("/decide", json={"request_id": "d1", "cost": 9})
+    assert r.json()["allowed"] is True
+    assert _global_balance(client) == 1.0
+    assert client.get("/reservations/rsv-sweep").json()["status"] == "expired"
+
+
+def test_batch_applies_legacy_whole_second_change_before_balance(client, clock):
+    # 批量裁决：整秒变更必须在整批余额计算前应用（同一事务、同一时刻）。
+    # 旧容量 100 打空 40（余 60），12:00:00 整秒切到容量 30 速率 0：
+    # 比例换算 60/100*30=18。两笔各 cost=9 恰好全部获准（旧策略下余 60 也够，
+    # 但换算后才是 18；用第三笔 cost=1 验证换算确实发生：整批应失败回滚）。
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "seed", "cost": 40})
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    _insert_pending_change(client, "ch-batch",
+                           effective=eff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           capacity=30, refill_rate=0)
+    clock.t = eff.replace(microsecond=250000)
+
+    ok = client.post("/decide-batches", json={
+        "batch_id": "b-ok",
+        "requests": [
+            {"request_id": "bd1", "cost": 9},
+            {"request_id": "bd2", "cost": 9},
+        ],
+    }).json()
+    assert ok["committed"] is True
+    assert _global_balance(client) == 0.0
+    assert client.get("/policy-changes/ch-batch").json()["status"] == "applied"
+
+    # 变更已应用后新容量 30：补充率 0，再打一笔 cost=1 也会被拒
+    again = client.post("/decide-batches", json={
+        "batch_id": "b-no",
+        "requests": [{"request_id": "bd3", "cost": 1}],
+    }).json()
+    assert again["committed"] is False
+    assert again["failed_index"] == 0
 
 
 def test_expired_reservation_replay_does_not_refund_again(client, clock):
@@ -2507,7 +2764,7 @@ def test_settle_less_actual_refunds_delta_and_persists(client, clock):
     assert body["allowed"] is True
     assert body["replayed"] is False
     assert body["actual_cost"] == 1.0
-    assert body["settled_at"] == "2026-09-27T12:00:00Z"
+    assert body["settled_at"] == "2026-09-27T12:00:00.000000Z"
     assert [b["balance"] for b in body["buckets"]] == [9.0, 5.0, 3.0]
     # 实际落库余额与响应一致（/buckets 按 scope 排序，用映射比较）
     live = {(b["scope"], b["tenant_id"]): b["balance"]
@@ -2520,7 +2777,7 @@ def test_settle_less_actual_refunds_delta_and_persists(client, clock):
     got = client.get("/reservations/rsv-s").json()
     assert got["status"] == "settled"
     assert got["actual_cost"] == 1.0
-    assert got["settled_at"] == "2026-09-27T12:00:00Z"
+    assert got["settled_at"] == "2026-09-27T12:00:00.000000Z"
 
     # 原确认行为保留：settled 上确认/取消均 409
     assert client.post("/reservations/rsv-s/confirm").status_code == 409
@@ -2658,7 +2915,7 @@ def test_settle_expiry_wins_and_persists_expired_with_refund(client, clock):
     assert r.status_code == 409
     body = client.get("/reservations/rsv-exp").json()
     assert body["status"] == "expired"
-    assert body["expired_at"] == "2026-09-27T12:00:30Z"
+    assert body["expired_at"] == "2026-09-27T12:00:30.000000Z"
     assert body["actual_cost"] is None and body["settled_at"] is None
     assert _global_balance(client) == 10.0  # 到期已返还并持久化
 
@@ -2841,6 +3098,92 @@ def test_old_reservations_table_is_migrated_for_settle(tmp_path):
             "SELECT status, actual_cost FROM reservations WHERE reservation_id='old-1'"
         ).fetchone()
         assert row[0] == "settled" and row[1] == 1.0
+    finally:
+        conn.close()
+
+
+def test_startup_migration_normalizes_whole_second_time_text(tmp_path):
+    """老库中的整秒时间文本（...00Z）在 init_db 时就地规范化为定宽 6 位微秒，
+    且数据本身不被改动；幂等，可重复执行。"""
+    import sqlite3
+    from app import database
+
+    db_file = tmp_path / "old_time.db"
+    # 先用正式 schema 建库，再灌入旧形态文本（模拟上个版本的写入）
+    database.init_db(str(db_file))
+    conn = sqlite3.connect(str(db_file))
+    try:
+        conn.execute(
+            "INSERT INTO policies (scope,tenant_id,route_id,capacity,refill_rate,"
+            "low_balance_threshold,updated_at) VALUES "
+            "('global','','',10,1,NULL,'2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO buckets (scope,tenant_id,route_id,balance,updated_at) "
+            "VALUES ('global','','',5,'2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO decisions (request_id,payload_hash,payload_json,allowed,"
+            "cost,decided_at,result_json) VALUES "
+            "('d1','h','{}',1,2,'2026-01-01T00:00:00Z','{}')"
+        )
+        conn.execute(
+            "INSERT INTO policy_changes (change_id,scope,tenant_id,route_id,"
+            "new_capacity,new_refill_rate,new_low_balance_threshold,effective_at,"
+            "status,created_at) VALUES "
+            "('c1','global','','',20,0,NULL,'2026-01-02T00:00:00Z',"
+            "'pending','2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO reservations (reservation_id,payload_hash,payload_json,"
+            "status,tenant_id,route_id,cost,ttl_seconds,created_at,expire_at,"
+            "confirmed_at,cancelled_at,expired_at,actual_cost,settled_at,buckets_json) "
+            "VALUES ('r1','h','{}','pending','','',3,60,"
+            "'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z',"
+            "NULL,NULL,NULL,NULL,NULL,'[[\"global\",\"\",\"\"]]')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    database.init_db(str(db_file))
+    database.init_db(str(db_file))  # 再次执行必须幂等
+    conn = sqlite3.connect(str(db_file))
+    try:
+        assert conn.execute(
+            "SELECT updated_at FROM policies WHERE scope='global'"
+        ).fetchone()[0] == "2026-01-01T00:00:00.000000Z"
+        assert conn.execute(
+            "SELECT updated_at FROM buckets WHERE scope='global'"
+        ).fetchone()[0] == "2026-01-01T00:00:00.000000Z"
+        assert conn.execute(
+            "SELECT decided_at FROM decisions WHERE request_id='d1'"
+        ).fetchone()[0] == "2026-01-01T00:00:00.000000Z"
+        ch = conn.execute(
+            "SELECT effective_at,created_at FROM policy_changes WHERE change_id='c1'"
+        ).fetchone()
+        assert tuple(ch) == (
+            "2026-01-02T00:00:00.000000Z", "2026-01-01T00:00:00.000000Z")
+        rsv = conn.execute(
+            "SELECT created_at,expire_at FROM reservations WHERE reservation_id='r1'"
+        ).fetchone()
+        assert tuple(rsv) == (
+            "2026-01-01T00:00:00.000000Z", "2026-01-01T00:01:00.000000Z")
+        # 余额等业务数据原样保留
+        assert conn.execute(
+            "SELECT balance FROM buckets WHERE scope='global'").fetchone()[0] == 5
+        # 规范化后到期判定可直接命中：把 pending 变更/预占视为已到期
+        from app import quota
+        c2 = database.connect(str(db_file))
+        try:
+            with database.write_tx(c2):
+                # effective_at 2026-01-02 远早于当前真实时刻 -> 可被取消判为到期，
+                # 这里直接验证清扫函数会选中该预占（expire_at 也已过去）
+                n = quota._expire_due_reservations(c2, quota.now_utc())
+                assert n == 1
+                assert quota.get_policy_change is not None  # 模块可用性
+        finally:
+            c2.close()
     finally:
         conn.close()
 
@@ -3250,7 +3593,7 @@ def test_usage_decisions_grouped_allowed_only_revoked_excluded(client, clock):
     start, end = _iso(clock.t - timedelta(seconds=1)), _iso(clock.t + timedelta(seconds=1))
     body = _usage(client, start, end).json()
 
-    assert body["evaluated_at"] == _iso(clock.t)
+    assert body["evaluated_at"] == _iso(clock.t).replace("Z", ".000000Z")
     # 分组顺序：全局 -> t1 -> (t1, /r1)；(t1, /r1) 无任何计入记录故不出现
     assert [(g["tenant_id"], g["route_id"]) for g in body["groups"]] == [
         (None, None), ("t1", None)
@@ -3359,6 +3702,49 @@ def test_usage_due_but_unswept_pending_counts_as_expired_without_mutation(client
     client.get("/reservations/rsv-due")
     assert _db_status("rsv-due") == "expired"
     assert _db_global_balance_raw() == 10.0
+
+
+def test_usage_window_includes_legacy_whole_second_rows_at_boundaries(client, clock):
+    # 历史整秒文本行必须按真实 UTC 参与窗口左闭右开与到期判定，
+    # 不能因 'Z' > '.' 的文本排序错位而被漏掉。
+    import sqlite3
+    from app.database import db_path
+    put_policy(client, "global", 10, 0)
+    r = client.post("/decide", json={"request_id": "d-leg", "cost": 4})
+    assert r.status_code == 200
+    t = "2026-09-27T12:00:00Z"  # 无小数秒的历史整秒文本
+    conn = sqlite3.connect(db_path())
+    try:
+        conn.execute("UPDATE decisions SET decided_at=? WHERE request_id='d-leg'", (t,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 起点恰为该整秒（左闭，含）：整秒旧行必须计入
+    body = _usage(client, "2026-09-27T12:00:00Z", "2026-09-27T13:00:00Z").json()
+    assert body["total_consumed"] == 4.0
+    # 起点晚一微秒（右移边界）：该行在窗口外
+    body2 = _usage(
+        client, "2026-09-27T12:00:00.000001Z", "2026-09-27T13:00:00Z").json()
+    assert body2["total_consumed"] == 0.0
+    # 终点恰为该整秒（右开，不含）
+    body3 = _usage(
+        client, "2026-09-27T11:00:00Z", "2026-09-27T12:00:00Z").json()
+    assert body3["total_consumed"] == 0.0
+
+
+def test_usage_legacy_whole_second_pending_due_not_held(client, clock):
+    # 整秒 expire_at、报表时刻在同秒带微秒：按到期处理，不计占用
+    put_policy(client, "global", 10, 0)
+    exp = datetime(2026, 9, 27, 12, 1, 0, tzinfo=timezone.utc)
+    _insert_pending_reservation(
+        client, "rsv-u", expire_text=exp.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    clock.t = exp.replace(microsecond=300000)
+    body = _usage(
+        client, "2026-09-27T11:00:00Z", "2026-09-27T13:00:00Z").json()
+    assert body["total_held"] == 0.0
+    # 只读：仍 pending
+    assert _db_status("rsv-u") == "pending"
 
 
 def test_usage_expired_and_cancelled_after_sweep_excluded(client, clock):
@@ -3873,6 +4259,40 @@ def test_route_transfer_conflict_still_applies_due_policy_changes(client):
     assert _route_balance(client, "t1", "rB") == 10.0
     chg = client.get("/policy-changes/chg-tr-b").json()
     assert chg["status"] == "applied"
+
+
+def test_route_transfer_applies_legacy_whole_second_change(client, clock):
+    """整秒生效文本 + 同秒带微秒的移拨时刻：前序事务必须按新策略处理。"""
+    _setup_two_routes(client, cap_a=10, cap_b=10)
+    # rA 打空 8（余 2，剩余比例 0.2）；rB 打空 5（余 5，腾出接收空间）
+    client.post(
+        "/decide",
+        json={"request_id": "d-a", "tenant_id": "t1", "route_id": "rA", "cost": 8},
+    )
+    client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 5},
+    )
+    eff = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+    _insert_pending_change(
+        client, "chg-tr-whole", scope="route",
+        effective=eff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        capacity=20, refill_rate=0, tenant="t1", route="rA")
+    # 未到生效点（前一微秒）：移拨按旧容量 10、余额 2 处理，移 3 源不足 -> 409
+    clock.t = eff - timedelta(microseconds=1)
+    early = _transfer(client, "tr-early", "t1", "rA", "rB", 3)
+    assert early.status_code == 409
+    assert client.get("/policy-changes/chg-tr-whole").json()["status"] == "pending"
+    # 同秒内带微秒（已过生效点）：前序事务应用切换，rA 余额 2/10*20=4，
+    # rB 余 5 接收 3 -> 8，移拨成功
+    clock.t = eff.replace(microsecond=750000)
+    r = _transfer(client, "tr-ok", "t1", "rA", "rB", 3)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"]["capacity"] == 20.0
+    assert body["source"]["balance"] == 1.0
+    assert body["target"]["balance"] == 8.0
+    assert client.get("/policy-changes/chg-tr-whole").json()["status"] == "applied"
 
 
 def test_route_transfer_failed_business_call_does_not_consume_nonce(client):

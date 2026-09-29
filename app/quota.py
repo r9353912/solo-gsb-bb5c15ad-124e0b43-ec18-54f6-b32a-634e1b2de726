@@ -24,17 +24,49 @@ def now_utc() -> datetime:
 
 
 def iso(dt: datetime) -> str:
-    """统一的 ISO 8601 UTC 文本，例如 2026-09-17T12:00:00.123456Z。"""
+    """统一的、可直接按字典序比较的 ISO 8601 UTC 文本，固定 6 位小数秒：
+    例如 2026-09-17T12:00:00.123456Z；恰好整秒输出 2026-09-17T12:00:00.000000Z。
+
+    必须始终保留 6 位小数秒：若整秒时省略小数（...:00Z），与同一秒内带微秒的
+    文本（...:00.500000Z）做字符串比较时，'Z'(0x5A) 排在 '.'(0x2E) 之后，
+    整秒时刻会被误判为「更晚」，导致恰好/已经到期的定时切换与预占到期不被
+    应用。库中早期无小数秒的历史记录由 database 启动迁移补齐，并在各到期
+    判定处以 parse_iso 解析后的真实 UTC 先后为准（见 time_le/time_gt 辅助）。
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def parse_iso(text: str) -> datetime:
     dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt.astimezone(timezone.utc)
+
+
+def time_le(stored: str, now: datetime) -> bool:
+    """库内时间文本（兼容无小数秒的历史整秒记录）是否不晚于 now——
+    以 parse_iso 解析后的真实 UTC 先后判定，绝不依赖字符串字典序。"""
+    return parse_iso(stored) <= now
+
+
+def time_gt(stored: str, now: datetime) -> bool:
+    """库内时间文本是否严格晚于 now（真实 UTC 先后）。"""
+    return parse_iso(stored) > now
+
+
+def due_sweep_lower_bound(now: datetime) -> str:
+    """到期清扫 SQL 预筛的保守上界（定宽规范文本，比 now 晚 1 秒）。
+
+    历史整秒记录（...00Z，无小数）与同秒内带微秒的规范文本做字典序比较时
+    最多产生「同一秒内」的错位（'Z' 排在 '.' 之后，整秒文本被排得更晚），
+    不同秒之间字典序与真实先后一致。故用 now+1s 的规范文本做 SQL 预筛：
+    所有真正到期（expire_at <= now）的行，无论新旧格式，其字典序都必然
+    小于该上界（同秒错位最多 1 秒，已被余量覆盖）；再由调用方用 time_le
+    做精确 UTC 过滤。启动迁移把历史记录规范化为定宽格式后，余量不再产生多余行。
+    """
+    return iso(now + timedelta(seconds=1))
 
 
 def payload_hash(payload: dict[str, Any]) -> str:
@@ -551,13 +583,17 @@ def cancel_policy_change(conn: sqlite3.Connection, change_id: str) -> dict[str, 
 
     ts = now_utc()
     # 双保险：effective_at 已到期的变更可能正被/已被裁决事务应用，
-    # 只取消仍为 pending 且生效时刻仍在未来的行
+    # 只取消仍为 pending 且生效时刻仍在未来的行。到期边界按真实 UTC 判定
+    # （parse_iso 解析，兼容库中无小数秒的整秒记录），不做文本比较。
+    if not time_gt(row["effective_at"], ts):
+        raise HTTPException(409, f"change_id={change_id!r} 已到生效时刻，无法取消")
     cur = conn.execute(
         "UPDATE policy_changes SET status='cancelled', cancelled_at=? "
-        "WHERE change_id=? AND status='pending' AND effective_at > ?",
-        (iso(ts), change_id, iso(ts)),
+        "WHERE change_id=? AND status='pending'",
+        (iso(ts), change_id),
     )
     if cur.rowcount == 0:
+        # 并发兜底：本事务持有写锁期间无其他写者，理论上不可达
         raise HTTPException(409, f"change_id={change_id!r} 已到生效时刻，无法取消")
     row = conn.execute(
         f"SELECT {_CHANGE_COLS} FROM policy_changes WHERE change_id=?",
@@ -650,8 +686,11 @@ def _apply_due_changes(
 
     逐条串行应用：每条都在同一事务内完成「余额换算 -> 覆盖策略 -> 标记 applied」，
     因此并发请求只能观察到完整的旧状态或完整的新状态，不会看到半成品。
+
+    到期判定一律 parse_iso 后按真实 UTC 先后比较（time_le），不能用 SQL 文本
+    字典序——库中历史整秒记录形如 ...00Z，与同秒内带微秒的 now 做文本比较
+    会把已到期的变更误判为未到期。
     """
-    now_iso = iso(now)
     for scope, tenant, route in keys:
         rows = conn.execute(
             """
@@ -659,12 +698,15 @@ def _apply_due_changes(
                    new_refill_rate, new_low_balance_threshold, effective_at
             FROM policy_changes
             WHERE scope=? AND tenant_id=? AND route_id=?
-              AND status='pending' AND effective_at <= ?
-            ORDER BY effective_at, id
+              AND status='pending'
             """,
-            (scope, tenant, route, now_iso),
+            (scope, tenant, route),
         ).fetchall()
-        for ch in rows:
+        # 同策略至多一条 pending（唯一索引保证）；排序仍按真实 UTC 时刻 + id，
+        # 兼容整秒与小数秒混存
+        due = [ch for ch in rows if time_le(ch["effective_at"], now)]
+        due.sort(key=lambda ch: (parse_iso(ch["effective_at"]), ch["change_id"]))
+        for ch in due:
             _apply_policy_change(conn, ch, now)
 
 
@@ -682,7 +724,9 @@ def _apply_policy_change(
     """
     scope, tenant, route = ch["scope"], ch["tenant_id"], ch["route_id"]
     effective_at = parse_iso(ch["effective_at"])
-    eff_iso = ch["effective_at"]
+    # 落库统一使用定宽规范文本：历史整秒记录（...00Z）的锚点也在此被规范化，
+    # 之后所有文本/数值比较看到的都是同一格式
+    eff_iso = iso(effective_at)
     new_cap = float(ch["new_capacity"])
     new_rate = float(ch["new_refill_rate"])
     new_threshold = ch["new_low_balance_threshold"]
@@ -2112,12 +2156,12 @@ def _expire_one_if_due(
         f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
         (reservation_id,),
     ).fetchone()
-    if row is None or row["status"] != "pending" or row["expire_at"] > iso(now):
+    if row is None or row["status"] != "pending" or not time_le(row["expire_at"], now):
         return False
     cur = conn.execute(
         "UPDATE reservations SET status='expired', expired_at=? "
-        "WHERE reservation_id=? AND status='pending' AND expire_at <= ?",
-        (iso(now), reservation_id, iso(now)),
+        "WHERE reservation_id=? AND status='pending'",
+        (iso(now), reservation_id),
     )
     if cur.rowcount == 0:
         return False
@@ -2133,17 +2177,21 @@ def _expire_due_reservations(conn: sqlite3.Connection, now: datetime) -> int:
     到期转换、返还与随后的余额读改写原子完成，不会漏还或重复返还。
     """
     now_iso = iso(now)
+    # SQL 仅作索引预筛（保守上界，保证真实到期的历史整秒记录不漏选），
+    # 精确的到期边界以 parse_iso 后的真实 UTC 先后在 Python 中判定。
     rows = conn.execute(
         f"SELECT {_RESERVATION_COLS} FROM reservations "
         "WHERE status='pending' AND expire_at <= ? ORDER BY expire_at, rowid",
-        (now_iso,),
+        (due_sweep_lower_bound(now),),
     ).fetchall()
+    due_rows = [r for r in rows if time_le(r["expire_at"], now)]
+    due_rows.sort(key=lambda r: (parse_iso(r["expire_at"]), r["reservation_id"]))
     count = 0
-    for row in rows:
+    for row in due_rows:
         cur = conn.execute(
             "UPDATE reservations SET status='expired', expired_at=? "
-            "WHERE reservation_id=? AND status='pending' AND expire_at <= ?",
-            (now_iso, row["reservation_id"], now_iso),
+            "WHERE reservation_id=? AND status='pending'",
+            (now_iso, row["reservation_id"]),
         )
         if cur.rowcount == 0:
             continue
@@ -2315,8 +2363,8 @@ def confirm_reservation(
     now_iso = iso(now)
     cur = conn.execute(
         "UPDATE reservations SET status='confirmed', confirmed_at=? "
-        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
-        (now_iso, reservation_id, now_iso),
+        "WHERE reservation_id=? AND status='pending'",
+        (now_iso, reservation_id),
     )
     if cur.rowcount == 0:
         # 并发兜底：本事务持有写锁，期间无其他写者能改此行，理论上不可达
@@ -2363,8 +2411,8 @@ def cancel_reservation(
     now_iso = iso(now)
     cur = conn.execute(
         "UPDATE reservations SET status='cancelled', cancelled_at=? "
-        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
-        (now_iso, reservation_id, now_iso),
+        "WHERE reservation_id=? AND status='pending'",
+        (now_iso, reservation_id),
     )
     if cur.rowcount == 0:
         # 事务开头的全局清扫之后不可能再到期；防御性 409
@@ -2528,8 +2576,9 @@ def settle_reservation(
             f"reservation_id={reservation_id!r} 当前状态为 {row['status']!r}，"
             "只有未到期的 pending 预占可以结算",
         )
-    if row["expire_at"] <= ts_iso:
-        # 防御：同刻的前序清扫事务应已把它转为 expired 并返还（到期优先）
+    if not time_gt(row["expire_at"], ts):
+        # 防御：同刻的前序清扫事务应已把它转为 expired 并返还（到期优先）。
+        # 到期边界按真实 UTC 判定（恰好到期也算到期），兼容无小数秒历史记录。
         raise HTTPException(
             409, f"reservation_id={reservation_id!r} 已到期（expired），无法结算"
         )
@@ -2540,8 +2589,8 @@ def settle_reservation(
 
     cur = conn.execute(
         "UPDATE reservations SET status='settled', actual_cost=?, settled_at=? "
-        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
-        (actual_cost, ts_iso, reservation_id, ts_iso),
+        "WHERE reservation_id=? AND status='pending'",
+        (actual_cost, ts_iso, reservation_id),
     )
     if cur.rowcount == 0:
         # 并发兜底：本事务持有写锁期间无其他写者能改此行，理论上不可达
@@ -2809,15 +2858,6 @@ def route_transfer(
 # ------------------------------------------------------------ 配额消耗核对（只读）
 
 
-def _canonical_window_iso(dt: datetime) -> str:
-    """把窗口边界格式化为与库内存储完全一致的规范 ISO 8601 UTC 文本，
-    使 decided_at / created_at 这类文本时间戳可以直接做字典序比较
-    （始终带 6 位微秒 + Z，避免无小数秒时 'Z' 与 '.' 的排序差异）。"""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
 def quota_usage(
     conn: sqlite3.Connection,
     *,
@@ -2828,7 +2868,8 @@ def quota_usage(
     未完成占用量。调用方必须在 database.read_tx 只读快照事务内调用：
     全程只做 SELECT，绝不推进预占到期状态、绝不改动预占或桶。
 
-    窗口为左闭右开 [start, end)：
+    窗口为左闭右开 [start, end)（按 parse_iso 解析后的真实 UTC 判定，
+    兼容库中无小数秒的整秒历史记录）：
       - 裁决按 decided_at 筛选；预占按 created_at 筛选；
       - 到期但尚未惰性清扫的 pending 预占按到期处理（与是否已转 expired 无关，
         只看 expire_at 与报表快照时刻 evaluated_at 的先后），故不计入占用。
@@ -2845,30 +2886,33 @@ def quota_usage(
 
     无匹配记录时 groups 为空列表。
     """
-    start_iso = _canonical_window_iso(start)
-    end_iso = _canonical_window_iso(end)
+    # 定宽规范文本；SQL 只作保守预筛（上下各放宽 1 秒，确保字典序错位仅可能
+    # 发生在同一秒内的历史整秒行不漏选），精确窗口边界在 Python 中按真实 UTC 判定
+    start_iso = iso(start)
+    end_iso = iso(end)
     evaluated_at = now_utc()
-    evaluated_iso = iso(evaluated_at)
 
-    # 同一只读快照内完成全部读取；文本时间戳同为规范 ISO 8601 UTC，
-    # 可直接字典序比较（左闭右开）
+    def _in_window(stored: str) -> bool:
+        ts = parse_iso(stored)
+        return start <= ts < end
+
     decision_rows = conn.execute(
         """
-        SELECT cost, payload_json
+        SELECT cost, payload_json, decided_at
         FROM decisions
         WHERE allowed = 1 AND revoked = 0
           AND decided_at >= ? AND decided_at < ?
         """,
-        (start_iso, end_iso),
+        (iso(start - timedelta(seconds=1)), iso(end + timedelta(seconds=1))),
     ).fetchall()
 
     reservation_rows = conn.execute(
         """
-        SELECT status, tenant_id, route_id, cost, actual_cost, expire_at
+        SELECT status, tenant_id, route_id, cost, actual_cost, expire_at, created_at
         FROM reservations
         WHERE created_at >= ? AND created_at < ?
         """,
-        (start_iso, end_iso),
+        (iso(start - timedelta(seconds=1)), iso(end + timedelta(seconds=1))),
     ).fetchall()
 
     # 分组键 -> 各类量的累加器；分组键取请求自身携带的 tenant/route
@@ -2892,6 +2936,8 @@ def quota_usage(
         return g
 
     for row in decision_rows:
+        if not _in_window(row["decided_at"]):
+            continue
         payload = json.loads(row["payload_json"])
         tenant = payload.get("tenant_id") or EMPTY
         route = payload.get("route_id") or EMPTY
@@ -2900,6 +2946,8 @@ def quota_usage(
         g["decision_count"] += 1
 
     for row in reservation_rows:
+        if not _in_window(row["created_at"]):
+            continue
         status = row["status"]
         if status not in ("confirmed", "settled", "pending"):
             # rejected / cancelled / expired 均不计入
@@ -2919,8 +2967,8 @@ def quota_usage(
         else:  # pending
             # 到期但尚未惰性清扫的 pending 也按到期处理（与 expired 同样完全
             # 不入账、不产生分组）：只与快照时刻比较，不执行任何 UPDATE
-            # （查询不得修改预占或桶）
-            if row["expire_at"] <= evaluated_iso:
+            # （查询不得修改预占或桶）。按真实 UTC 判定，兼容整秒历史记录。
+            if not time_gt(row["expire_at"], evaluated_at):
                 continue
             g = _bucket(tenant, route)
             g["held"] += float(row["cost"])
@@ -2957,7 +3005,7 @@ def quota_usage(
     return {
         "start": start_iso,
         "end": end_iso,
-        "evaluated_at": evaluated_iso,
+        "evaluated_at": iso(evaluated_at),
         "total_consumed": float(total_consumed),
         "total_held": float(total_held),
         "groups": out_groups,

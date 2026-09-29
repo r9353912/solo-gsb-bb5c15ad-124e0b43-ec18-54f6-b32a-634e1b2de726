@@ -10,8 +10,11 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+_UTC = timezone.utc
 
 # 所有策略层（全局 / 租户 / 路由）的公共行
 # scope: 'global' | 'tenant' | 'route'
@@ -183,7 +186,9 @@ CREATE TABLE IF NOT EXISTS reservations (
     buckets_json   TEXT NOT NULL
 ) STRICT;
 
--- 到期清扫只扫描 pending 行（部分索引），expire_at 与 ISO 8601 UTC 文本可直接字典序比较
+-- 到期清扫只扫描 pending 行（部分索引），expire_at 一律存定宽 6 位小数秒的
+-- ISO 8601 UTC 文本（YYYY-MM-DDTHH:MM:SS.ffffffZ），字典序即真实 UTC 先后；
+-- 历史整秒记录在启动迁移中补齐，到期判定另以解析后的 UTC 时刻为准（双保险）
 CREATE INDEX IF NOT EXISTS idx_reservations_due
 ON reservations (expire_at)
 WHERE status = 'pending';
@@ -261,6 +266,86 @@ def init_db(path: str | None = None) -> None:
         conn.close()
 
 
+def _canonical_iso_text(text: str) -> str | None:
+    """把库中旧版写入的 ISO 8601 UTC 文本规范化为定宽 6 位小数秒格式。
+
+    旧版 iso() 在微秒为 0 时省略小数秒，整秒时刻存为 ...T00:00:00Z；
+    它与同秒内带微秒的规范文本（...T00:00:00.500000Z）做字符串字典序比较
+    时会被误判为更晚（'Z' > '.'），破坏到期判定。规范化后所有时间列均为
+    `YYYY-MM-DDTHH:MM:SS.ffffffZ`，字典序与真实 UTC 先后一致。
+    无法解析的文本（理论上不存在）原样保留，由业务层 parse 时报错。
+    """
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+# 需规范化的（表, 列）：凡参与到期/先后比较或会成为桶时间锚点的列都在此。
+# policy_versions 为只追加的不可变审计表，不做就地改写。
+_TIME_TEXT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("policies", "updated_at"),
+    ("buckets", "updated_at"),
+    ("decisions", "decided_at"),
+    ("decisions", "retry_at"),
+    ("decisions", "revoked_at"),
+    ("decide_batches", "decided_at"),
+    ("low_balance_events", "created_at"),
+    ("policy_changes", "effective_at"),
+    ("policy_changes", "created_at"),
+    ("policy_changes", "applied_at"),
+    ("policy_changes", "cancelled_at"),
+    ("reservations", "created_at"),
+    ("reservations", "expire_at"),
+    ("reservations", "confirmed_at"),
+    ("reservations", "cancelled_at"),
+    ("reservations", "expired_at"),
+    ("reservations", "settled_at"),
+    ("route_transfers", "transferred_at"),
+)
+
+
+def _normalize_time_text(conn: sqlite3.Connection) -> None:
+    """把库中无小数秒的历史整秒时间文本就地补齐为定宽 6 位微秒格式（幂等）。
+
+    绝大多数历史行形如 ...T00:00:00Z，用 SQL 批量补齐（秒数为 60 的闰秒写法
+    Python 不支持，且本系统从不写入，故仅处理 SS=00..59 的正常整秒）；
+    其余非规范但可解析的文本（带时区偏移等）走 Python 逐行兜底。
+    """
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    for table, column in _TIME_TEXT_COLUMNS:
+        if table not in tables:
+            continue
+        # SQL 快路径：...THH:MM:SSZ（无小数点）-> ...THH:MM:SS.000000Z
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET {column} = substr({column}, 1, length({column}) - 1) || '.000000Z'
+            WHERE {column} IS NOT NULL
+              AND instr({column}, '.') = 0
+              AND {column} LIKE '%Z'
+            """
+        )
+        # Python 兜底：仍非定宽规范、但能按 ISO 8601 解析的行
+        rows = conn.execute(
+            f"SELECT rowid, {column} FROM {table} "
+            f"WHERE {column} IS NOT NULL AND {column} NOT LIKE '%.______Z'"
+        ).fetchall()
+        for rowid, value in rows:
+            canonical = _canonical_iso_text(value)
+            if canonical is not None and canonical != value:
+                conn.execute(
+                    f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                    (canonical, rowid),
+                )
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """老库就地升级：CREATE TABLE IF NOT EXISTS 不会给已有表补新列。"""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(policies)")}
@@ -269,27 +354,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE policies ADD COLUMN low_balance_threshold REAL "
             "CHECK (low_balance_threshold IS NULL OR low_balance_threshold >= 0)"
         )
-
-    # 老库（或上个版本写入的策略）首次升级时，按当前策略为尚无版本记录的
-    # 策略补登一条 version=1 的 baseline，时间取策略 updated_at。
-    # 之后所有策略版本都从 2 开始单调递增；重复启动幂等。
-    conn.execute(
-        """
-        INSERT INTO policy_versions
-            (scope, tenant_id, route_id, version, capacity, refill_rate,
-             low_balance_threshold, source, change_id, restored_from_version,
-             created_at)
-        SELECT p.scope, p.tenant_id, p.route_id, 1, p.capacity, p.refill_rate,
-               p.low_balance_threshold, 'baseline', NULL, NULL, p.updated_at
-        FROM policies p
-        WHERE NOT EXISTS (
-            SELECT 1 FROM policy_versions v
-            WHERE v.scope = p.scope
-              AND v.tenant_id = p.tenant_id
-              AND v.route_id = p.route_id
-        )
-        """
-    )
 
     # 老库 reservations 表（结算功能上线前）：status CHECK 不含 settled、
     # 且缺少 actual_cost / settled_at 列。SQLite 不能直接改 CHECK 约束，
@@ -349,6 +413,32 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    # 历史整秒时间文本（...T00:00:00Z）规范化为定宽 6 位小数秒：
+    # 必须在 reservations 旧表重建之后（新表才有 settled_at 等列），
+    # 并在 baseline 版本补登之前（使补登时间同为规范格式）。幂等，可重复执行。
+    _normalize_time_text(conn)
+
+    # 老库（或上个版本写入的策略）首次升级时，按当前策略为尚无版本记录的
+    # 策略补登一条 version=1 的 baseline，时间取策略 updated_at。
+    # 之后所有策略版本都从 2 开始单调递增；重复启动幂等。
+    conn.execute(
+        """
+        INSERT INTO policy_versions
+            (scope, tenant_id, route_id, version, capacity, refill_rate,
+             low_balance_threshold, source, change_id, restored_from_version,
+             created_at)
+        SELECT p.scope, p.tenant_id, p.route_id, 1, p.capacity, p.refill_rate,
+               p.low_balance_threshold, 'baseline', NULL, NULL, p.updated_at
+        FROM policies p
+        WHERE NOT EXISTS (
+            SELECT 1 FROM policy_versions v
+            WHERE v.scope = p.scope
+              AND v.tenant_id = p.tenant_id
+              AND v.route_id = p.route_id
+        )
+        """
+    )
 
 
 @contextmanager

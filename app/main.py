@@ -96,7 +96,7 @@ app = FastAPI(
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
         "GET、裁决（含批量）、预演、撤销、预占、配额规划与配额消耗核对接口无需认证。"
     ),
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
